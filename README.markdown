@@ -27,15 +27,17 @@ Uses a psycopg2 asynchronous connection and returns dict-based `Row` objects via
 The `Connection` class initializes a connection to the database, and encapsulates all query methods.
 
 Arguments:
-host -- postgresql host
-database -- postgresql database
+
+ * host -- postgresql host
+ * database -- postgresql database
 
 Keyword arguments:
-user -- postgresql user
-password -- postgresql password
-port -- postgresql connection port
-ioloop -- `tornado.ioloop.IOLoop` instance to use for callbacks and fd handlers. Shouldn't normally be required.
-callback -- callback to execute on connection initialization
+
+ * user -- postgresql user
+ * password -- postgresql password
+ * port -- postgresql connection port
+ * ioloop -- `tornado.ioloop.IOLoop` instance to use for callbacks and fd handlers. Shouldn't normally be required.
+ * callback -- callback to execute on connection initialization
 
 #### `query`
 Executes the query given and returns a row list. Either ordered or named parameters can be used (but not mixed).
@@ -46,11 +48,13 @@ Executes the query given and returns a row list. Either ordered or named paramet
         email='test@example.com')
         
 Arguments:
-query -- The query string. All data values should be replaced with %s
-*parameters -- data for substitution in the query string, in order
+
+ * query -- The query string. All data values should be replaced with %s
+ * *parameters -- data for substitution in the query string, in order
 
 Keyword arguments:
-**kwparameters -- data for substitution in the query string
+
+ * **kwparameters -- data for substitution in the query string
 
 #### `get`
 Same as `query`, but returns a single object rather than a list.
