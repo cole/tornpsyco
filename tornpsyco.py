@@ -23,7 +23,7 @@ Datetimes returned via psycopg2 have a custom timezone set. To minimize confusio
 use the UTC offset for all datetime objects (e.g. `datetime.datetime.now(UTC)`).
 """
 import functools
-import types
+import queue
 
 import psycopg2
 import psycopg2.extensions
@@ -54,12 +54,13 @@ class Connection(object):
     def __init__(self, host, database, **kwparameters):
 
         self._db = None
-        self._ioloop = kwparameters.get('ioloop') or IOLoop.current()
+        self._waiting_queries = queue.Queue()
+        self._ioloop = kwparameters.get('ioloop', None)
         self._dbargs = {
             'async': 1,
             'host': host,
             'database': database
-        }        
+        }
         for arg in ('user', 'password', 'port'):
             if kwparameters.get(arg) is not None:
                 self._dbargs[arg] = kwparameters[arg]
@@ -70,10 +71,14 @@ class Connection(object):
     def _open(self, **kwparameters):
         """Open the psycopg2 connction, and poll for OK."""
         self._db = psycopg2.connect(**self._dbargs)
-
-        callback = kwparameters.pop('callback', None)                
+        if not self._ioloop:
+            self._ioloop = IOLoop.current()
+        callback = kwparameters.pop('callback', self._on_ok)
         handler = functools.partial(self._poll, callback=callback)
         self._ioloop.add_handler(self._fd, handler, IOLoop.WRITE)
+        
+    def _on_ok(self, fd, events, **kwparameters):
+        self._ready = True
     
     def close(self):
         """Close the database connection"""
@@ -112,10 +117,11 @@ class Connection(object):
         callback = kwparameters.pop('callback', None)
         state = self._db.poll()
         if state == psycopg2.extensions.POLL_OK:
-            # Connection is clear for use            
+            # Connection is clear for use
             self._ioloop.remove_handler(fd)
             if callback is not None:
                 callback() # results retrieved from cursor later
+            self._execute_next()
         elif state == psycopg2.extensions.POLL_READ:
             # Reading
             self._ioloop.update_handler(fd, IOLoop.READ)
@@ -125,6 +131,42 @@ class Connection(object):
         else:
             # Arithmatic (just kidding, error)
             raise psycopg2.OperationalError("poll returned a bad state: {}".format(state))
+
+    def _poll_sync(self):
+        """Poll until ready — used for sync queries.
+        """
+        while True:
+            state = self._db.poll()
+            if state == psycopg2.extensions.POLL_OK:
+                break
+            elif state == psycopg2.extensions.POLL_WRITE:
+                pass
+            elif state == psycopg2.extensions.POLL_READ:
+                pass
+            else:
+                raise psycopg2.OperationalError("poll() returned %s" % state)
+
+    def _execute_next(self):
+        try:
+            bound = self._waiting_queries.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            bound()
+    
+    def _queue(self, result_handler, query, params):
+        if self.busy:
+            bound = functools.partial(self._execute, result_handler, query, params)
+            self._waiting_queries.put_nowait(bound)
+        else:
+            self._execute(result_handler, query, params)            
+    
+    def _execute(self, result_handler, query, params):
+        cursor = self._cursor(cursor_factory=RowCursor)
+        cursor.execute(query, params)
+        result_handler = functools.partial(result_handler, cursor)
+        io_handler = functools.partial(self._poll, callback=result_handler)
+        self._ioloop.add_handler(self._fd, io_handler, IOLoop.WRITE)
     
     @return_future
     def query(self, query, *parameters, **kwparameters):
@@ -142,18 +184,30 @@ class Connection(object):
         
         Keyword arguments:
         **kwparameters -- data for substitution in the query string
-        """        
+        """
         callback = kwparameters.pop('callback', None)
-        cursor = self._cursor(cursor_factory=RowCursor)
-        cursor.execute(query, kwparameters or parameters)
-        def handle_result():
+        def handle_result(cursor):
             try:
                 results = cursor.fetchall()
             finally:
                 cursor.close()
             callback(results)
-        handler = functools.partial(self._poll, callback=handle_result)
-        self._ioloop.add_handler(self._fd, handler, IOLoop.WRITE)
+        
+        self._queue(handle_result, query, kwparameters or parameters)
+        
+    def query_sync(self, query, *parameters, **kwparameters):
+        """Sync version of query.
+        """
+        assert not 'callback' in kwparameters, "No callbacks!"
+        self._poll_sync() # poll until we're ready to go
+        cursor = self._cursor(cursor_factory=RowCursor)
+        cursor.execute(query, kwparameters or parameters)
+        self._poll_sync() # poll for results
+        try:
+            results = cursor.fetchall()
+        finally:
+            cursor.close()
+        return results
     
     @return_future
     def get(self, query, *parameters, **kwparameters):
@@ -168,6 +222,17 @@ class Connection(object):
                 callback(rows[0])
         kwparameters.update(callback=handle_results)
         self.query(query, *parameters, **kwparameters)
+        
+    def get_sync(self, query, *parameters, **kwparameters):
+        """Sync version of get.
+        """
+        results = self.query_sync(query, *parameters, **kwparameters)
+        if len(results) > 1:
+            raise MultipleRowsReturnedError("Multiple rows returned for get query")
+        elif not results:
+            return None
+        else:
+            return results[0]
 
     @return_future
     def execute(self, query, *parameters, **kwparameters):
@@ -187,7 +252,7 @@ class Connection(object):
                 else:
                     try:
                         result = cursor.fetchone()
-                    except (ProgrammingError) as e:
+                    except ProgrammingError:
                         result = None
             finally:
                 cursor.close()
